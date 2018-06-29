@@ -16,10 +16,14 @@
 #include "sysemu/sysemu.h"
 #include "sysemu/block-backend.h"
 #include <qemu/main-loop.h>
+#include <nilfs.h>
 
 #include "femu-oc.h"
 #include "../nvme.h"
 #include "god.h"
+#include "../../../include/sysemu/block-backend.h"
+#include "../../../include/block/block.h"
+#include "../../../include/sysemu/dma.h"
 
 extern void nvme_set_error_page(NvmeCtrl *n, uint16_t sqid, uint16_t cid,
         uint16_t status, uint16_t location, uint64_t lba, uint32_t nsid);
@@ -45,8 +49,8 @@ uint16_t femu_oc_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     NvmeRequest *req);
 void femu_oc_post_cqe(NvmeCtrl *n, NvmeRequest *req);
 void print_ppa(FEMU_OC_Ctrl *ln, uint64_t ppa);
-int femu_oc_meta_write(FEMU_OC_Ctrl *ln, void *meta);
-int femu_oc_meta_read(FEMU_OC_Ctrl *ln, void *meta);
+int femu_oc_meta_write(FEMU_OC_Ctrl *ln, void *meta, uint64_t ppa);
+int femu_oc_meta_read(FEMU_OC_Ctrl *ln, void *meta, uint64_t ppa);
 int64_t femu_oc_ppa_to_off(FEMU_OC_Ctrl *ln, uint64_t r);
 int femu_oc_meta_state_get(FEMU_OC_Ctrl *ln, uint64_t ppa, uint32_t *state);
 int femu_oc_meta_blk_set_erased(NvmeNamespace *ns, FEMU_OC_Ctrl *ln,
@@ -213,15 +217,18 @@ void print_ppa(FEMU_OC_Ctrl *ln, uint64_t ppa)
  * NOTE: Ensure that `femu_oc_set_written_state` has been called prior to this
  * function to ensure correct file offset of ln->metadata?
  */
-int femu_oc_meta_write(FEMU_OC_Ctrl *ln, void *meta)
+int femu_oc_meta_write(FEMU_OC_Ctrl *ln, void *meta, uint64_t ppa)
 {
 #if 0
     FILE *meta_fp = ln->metadata;
     size_t tgt_oob_len = ln->params.sos;
     size_t ret;
 #endif
+    uint32_t oft = ppa * ln->meta_len;
+    assert(oft + ln->meta_len <= ln->meta_tbytes);
 
-    memcpy(ln->meta_buf, meta, ln->params.sos);
+    memcpy(&ln->meta_buf[oft+ln->int_meta_size], meta, ln->params.sos);
+    //memcpy(ln->meta_buf, meta, ln->params.sos);
     return 0;
 
 #if 0
@@ -246,15 +253,20 @@ int femu_oc_meta_write(FEMU_OC_Ctrl *ln, void *meta)
  * NOTE: Ensure that `femu_oc_meta_state_get` has been called to have the correct
  * file offset in ln->metadata?
  */
-int femu_oc_meta_read(FEMU_OC_Ctrl *ln, void *meta)
+int femu_oc_meta_read(FEMU_OC_Ctrl *ln, void *meta, uint64_t ppa)
 {
 #if 0
     FILE *meta_fp = ln->metadata;
     size_t tgt_oob_len = ln->params.sos;
     size_t ret;
 #endif
+    
+    
+    uint32_t oft = ppa * ln->meta_len;
+    assert(oft + ln->meta_len <= ln->meta_tbytes);
 
-    memcpy(meta, ln->meta_buf, ln->params.sos);
+    memcpy(meta, &ln->meta_buf[oft+ln->int_meta_size], ln->params.sos);
+    //memcpy(meta, ln->meta_buf, ln->params.sos);
     return 0;
 
 #if 0
@@ -648,7 +660,7 @@ uint16_t femu_oc_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     //int pl, blk, sec;
     int64_t io_done_ts = 0, start_data_transfer_ts = 0;
     int64_t need_to_emulate_tt = 0;
-    //printf("Coperd,opcode=%d,n_pages=%d\n", req->cmd_opcode, n_pages);
+    printf("Coperd,opcode=%d,n_pages=%d\n", req->cmd_opcode, n_pages);
 
     if (is_write) {
         /* Coperd: LightNVM only issues 32KB I/O writes */
@@ -797,12 +809,18 @@ uint16_t femu_oc_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
 #endif
 
             if (meta) {
-                if (femu_oc_meta_write(ln, femu_oc_meta_index(ln, msl, i))) {
+                if (femu_oc_meta_write(ln, femu_oc_meta_index(ln, msl, i), ppa)) {
                     printf("femu_oc_rw: write metadata failed\n");
                     print_ppa(ln, psl[i]);
                     err = NVME_INVALID_FIELD | NVME_DNR;
                     goto fail_free_msl;
                 }
+                /*
+                char* tmpmeta = (char *)femu_oc_meta_index(ln, msl, i);
+                printf("metadata got for page %d, %lx\n", i, ppa);
+                for(int j = 0; j < ln->params.sos; j++) putchar(tmpmeta[j]);
+                printf("\n");
+                */
             }
         } else if (!is_write){
             uint32_t state;
@@ -815,6 +833,8 @@ uint16_t femu_oc_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
             }
 
             if (state != FEMU_OC_SEC_WRITTEN) {
+                printf("femu_oc_rw: the page state is %d, not WRITTEN, the ppa is:", state);
+                print_ppa(ln, psl[i]);
                 bitmap_set(&cqe->res64, i, n_pages - i);
                 req->status = 0x42ff;
 
@@ -827,12 +847,23 @@ uint16_t femu_oc_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
             }
 
             if (meta) {
-                if (femu_oc_meta_read(ln, femu_oc_meta_index(ln, msl, i))) {
+                if (femu_oc_meta_read(ln, femu_oc_meta_index(ln, msl, i), ppa)) {
                     printf("femu_oc_rw: read metadata failed\n");
                     print_ppa(ln, psl[i]);
                     err = NVME_INVALID_FIELD | NVME_DNR;
                     goto fail_free_msl;
                 }
+                /*
+                 * nvme_addr_write(n, meta, (void *)msl,
+                        n_pages * ln->params.sos);
+                */
+
+                /*
+                char* tmpmeta = &ln->meta_buf[ppa*ln->meta_len + ln->int_meta_size];
+                printf("metadata got for page %d, %lx\n", i, ppa);
+                for(int j = 0; j < ln->params.sos; j++) putchar(tmpmeta[j]);
+                printf("\n");
+                */
             }
         }
     }
@@ -1172,7 +1203,8 @@ uint16_t femu_oc_erase_async(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         psl[0] = spba;
     }
 
-#if 0
+#if 1
+    printf("erase blocks %d: ", nlb);
     int i;
     for (i = 0; i < nlb; i++) {
         print_ppa(ln, psl[i]);
@@ -1278,7 +1310,7 @@ int femu_oc_init_meta(FEMU_OC_Ctrl *ln)
     ln->meta_len = ln->int_meta_size + ln->params.sos;
     ln->meta_tbytes = ln->meta_len * ln->params.total_secs;
     /* Coperd: we put all the meta data into this buffer */
-    printf("Coperd,allocating meta_buf: %d MB\n", ln->meta_tbytes/1024/1024);
+    printf("Coperd,allocating meta_buf: %d B\n", ln->meta_tbytes);
     ln->meta_buf = malloc(ln->meta_tbytes);
     if (!ln->meta_buf) {
         printf("Coperd, meta buffer allocation failed!\n");
@@ -1414,6 +1446,7 @@ int femu_oc_init(NvmeCtrl *n)
     if (ln->params.num_ch != 1)
         error_report("nvme: Only 1 channel is supported at the moment\n");
 #endif
+    printf("Sirius,pgs_per_blk %d, sec_size %d, sec_per_pg %d, max_sec_per_rq %d\n", ln->params.pgs_per_blk, ln->params.sec_size, ln->params.sec_per_pg, ln->params.max_sec_per_rq);
     if ((ln->params.num_pln > 4) || (ln->params.num_pln == 3))
         error_report("nvme: Only single, dual and quad plane modes supported \n");
 
